@@ -2,6 +2,7 @@ from cffi import FFI
 import atexit
 import numpy as np
 import warnings
+import threading
 
 """PySoundCard is an audio library based on PortAudio, CFFI and NumPy
 
@@ -642,6 +643,77 @@ class Stream(object):
         data = data.ravel().tostring()
         err = _pa.Pa_WriteStream(self._stream, data, num_frames)
         self._handle_error(err)
+
+
+class KeepAwake(threading.Thread):
+
+    """Class to keep Streams responsive by playing background silence.
+
+    The motivation is to have a way to avoid ~0.5s latency when starting a
+    Stream if sound has been inactive for ~60s and the hardware goes to sleep,
+    which happens on Macs and possibly other laptops.
+
+    Usage:
+
+        KeepAwake(**options)
+
+      or
+
+        k = KeepAwake(**options)
+        ...
+        k.stop()
+
+    Requirements:
+        a) Some CPU use, more with smaller blocksizes
+        b) hardware / audio lib must support concurrent streams
+        c) user Stream()s must use the same rate, block, chnls, dtype, or
+           get various PA errors about the mismatches.
+
+    """
+
+    def __init__(self, sample_rate=None, block_length=None,
+                 output_channels=None, sample_format=None):
+        """Define and start a silent Stream of indefinite length.
+
+        """
+        super(KeepAwake, self).__init__(None, 'KeepAwake', None)
+        self.daemon = True  # allows fast program exit
+        info = default_output_device()
+        self.sample_rate = sample_rate or info['default_sample_rate']
+        self.output_channels = output_channels or info['output_channels']
+        self.block_length = block_length or 1024
+        dtype = sample_format or info['sample_format']
+        self.zeroes = np.array([0] * self.block_length * self.output_channels,
+                               dtype=dtype)
+        self.return_flag = continue_flag
+
+        # starting will trigger initial lag, if any:
+        self.start()  # starting the thread calls .run()
+
+    def callback(self, *args, **kwargs):
+        """Return zeros indefinitely
+
+        """
+        return self.zeroes, self.return_flag
+
+    def run(self):
+        """Start the stream; called by .start()
+
+        """
+        self.stream = Stream(sample_rate=self.sample_rate,
+                             block_length=self.block_length,
+                             callback=self.callback)
+        self.stream.start()
+
+    def stop(self):
+        """Abort the Stream and stop the thread; not typically needed.
+
+        """
+        self.return_flag = complete_flag
+        if hasattr(self, 'stream'):
+            # may not exist yet if you call .stop() immediately
+            self.stream.abort()
+        self._Thread__stop()
 
 
 if __name__ == '__main__':
